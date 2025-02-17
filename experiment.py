@@ -1,6 +1,6 @@
 import torch as th
 from nnterp.nnsight_utils import get_layer_output, get_layer
-from tiny_dashboard.html_utils import create_highlighted_tokens_html, create_example_html
+from tiny_dashboard.html_utils import create_highlighted_tokens_html, create_example_html, create_base_html
 
 class Experiment:
 
@@ -133,6 +133,8 @@ class Experiment:
         example_html = create_example_html(
                     max_acts_str, html_content, static=True
                 )
+
+        html = create_base_html(title="hello", content=example_html)
         
         # print(example_html)
-        return example_html
+        return html
