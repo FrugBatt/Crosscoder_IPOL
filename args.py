@@ -1,5 +1,6 @@
 import argparse
 from tiny_dashboard.utils import parse_list_str
+import os
 
 def get_config():
     parser = argparse.ArgumentParser(description='Run a crosscoder experiment')
@@ -15,10 +16,12 @@ def get_config():
 
     args = parser.parse_args()
 
+    ROOT = os.path.dirname(os.path.realpath(__file__))
+
     config = {
         'base_model_name': args.base_model_name,
         'chat_model_name': args.chat_model_name,
-        'output_file': args.output_file,
+        'output_file': os.path.join(ROOT, args.output_file),
         'prompt': args.prompt,
         'features_compute': parse_list_str(args.features_compute),
         'highlight_features': parse_list_str(args.highlight_features),

@@ -27,7 +27,7 @@ exp = Experiment(base_model, chat_model, CrossCoder(hsize, 16_000, 2), 14, cross
 html = exp.run(config['prompt'], config['features_compute'], config['highlight_features'], config['tooltip_features'])
 
 if os.path.exists(config['output_file']):
-    os.remove(config.output_file)
+    os.remove(config['output_file'])
 
 with open(config['output_file'], 'w') as f:
     f.write(html)
