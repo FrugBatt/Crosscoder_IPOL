@@ -1,0 +1,5 @@
+torch==2.5.1
+transformers==4.48.3
+nnterp==0.4.5
+huggingface_hub==0.24.6
+tiny-dashboard==0.7.3
