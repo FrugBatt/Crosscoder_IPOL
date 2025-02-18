@@ -21,7 +21,7 @@ def get_config():
 
     try:
         features_compute_list = parse_list_str(args.features_compute)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         file_name = 'demo_failure.txt'
         with open(file_name, 'w') as f:
             f.write('features_compute needs to be a list of integers')
