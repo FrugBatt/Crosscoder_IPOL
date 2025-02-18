@@ -1,6 +1,7 @@
 import argparse
 from tiny_dashboard.utils import parse_list_str
 import os
+import sys
 
 def get_config():
     parser = argparse.ArgumentParser(description='Run a crosscoder experiment')
@@ -17,6 +18,14 @@ def get_config():
     args = parser.parse_args()
 
     ROOT = os.path.dirname(os.path.realpath(__file__))
+
+    try:
+        features_compute_list = parse_list_str(args.features_compute)
+    except SyntaxError:
+        file_name = 'demo_failure.txt'
+        with open(file_name, 'w') as f:
+            f.write('features_compute needs to be a list of integers')
+        sys.exit(0)
 
     config = {
         'base_model_name': args.base_model_name,
