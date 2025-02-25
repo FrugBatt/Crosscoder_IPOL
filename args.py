@@ -27,15 +27,31 @@ def get_config():
             f.write('features_compute needs to be a list of integers')
         sys.exit(0)
 
+    try:
+        highlight_features_list = parse_list_str(args.highlight_features)
+    except (SyntaxError, ValueError):
+        file_name = 'demo_failure.txt'
+        with open(file_name, 'w') as f:
+            f.write('highlight_features needs to be a list of integers')
+        sys.exit(0)
+
+    try:
+        tooltip_features_list = parse_list_str(args.tooltip_features)
+    except (SyntaxError, ValueError):
+        file_name = 'demo_failure.txt'
+        with open(file_name, 'w') as f:
+            f.write('tooltip_features needs to be a list of integers')
+        sys.exit(0)
+
     config = {
         'base_model_name': args.base_model_name,
         'chat_model_name': args.chat_model_name,
         # 'output_file': os.path.join(ROOT, args.output_file),
         'output_file': args.output_file,
         'prompt': args.prompt,
-        'features_compute': parse_list_str(args.features_compute),
-        'highlight_features': parse_list_str(args.highlight_features),
-        'tooltip_features': parse_list_str(args.tooltip_features),
+        'features_compute': features_compute_list,
+        'highlight_features': highlight_features_list,
+        'tooltip_features': tooltip_features_list,
         'max_activations': args.max_activations,
     }
 
