@@ -53,7 +53,6 @@ class Encoder(nn.Module):
     def forward(
         self,
         x: th.Tensor,
-        return_no_sum: bool = False,
         select_features: list[int] | None = None,
     ) -> th.Tensor:  # (batch_size, activation_dim)
         """
