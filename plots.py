@@ -1,6 +1,6 @@
 # %%
 import torch as th
-from dictionary_learning.dictionary import CrossCoder
+from crosscoder import CrossCoder
 
 path = "models/1740989131_provocative-harrier/1740989131_provocative-harrier_16k5e-2/3001344_toks.pt"
 model = CrossCoder.from_pretrained(path)
@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory() as directory:
 # %%
 model.decoder.weight.shape
 # %%
-from dictionary_learning.dictionary import CrossCoder
+from crosscoder import CrossCoder
 
 hf_model = CrossCoder.from_pretrained(
     "Butanium/crosscoder-Qwen2.5-0.5B-Instruct-and-Base-16k5e-2-3M-toks", from_hub=True
@@ -59,8 +59,11 @@ for param, hf_param in zip(model.parameters(), hf_model.parameters()):
 
 
 # %%
+from crosscoder import CrossCoder
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import numpy as np
+import torch as th
 
 plt.rcParams["text.usetex"] = True
 plt.rcParams.update({"font.size": 20})
@@ -112,22 +115,40 @@ def plot_norm_hist(crosscoder, name, fig=None, ax=None):
 
 
 # %%
-tokens = [1000448, 2000896, 3001344]
-widths = ["16k", "32k"]
-L1_penalties = ["5e-2", "3e-2"]
-from itertools import product
-
-all_settings = list(product(tokens, widths, L1_penalties))
-
-fig, axes = plt.subplots(3, 4, figsize=(30, 16))
-from tqdm import tqdm
-
-for (tokens, width, L1_penalty), ax in tqdm(
-    zip(all_settings, axes.flatten()), total=len(all_settings)
+def plot_norm_hist_grid(
+    model_dir, run_name, tokens=None, widths=None, L1_penalties=None
 ):
-    path = f"models/1740989131_provocative-harrier/1740989131_provocative-harrier_{width}{L1_penalty}/{tokens}_toks.pt"
-    model = CrossCoder.from_pretrained(path)
-    tok_string = f"{tokens // 1e6}M tokens"
-    plot_norm_hist(model, f"{width} {L1_penalty} {tok_string}", ax=ax, fig=fig)
-plt.savefig("norm_hist.png", dpi=300)
+    if tokens is None:
+        tokens = [1000448, 2000896, 3001344]
+    if widths is None:
+        widths = ["16k", "32k"]
+    if L1_penalties is None:
+        L1_penalties = ["5e-2", "3e-2"]
+
+    from itertools import product
+
+    all_settings = list(product(tokens, widths, L1_penalties))
+
+    num_rows = len(tokens)
+    num_cols = len(widths) * len(L1_penalties)
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(30, 16))
+    from tqdm import tqdm
+
+    for (tokens, width, L1_penalty), ax in tqdm(
+        zip(all_settings, axes.flatten()), total=len(all_settings)
+    ):
+        path = f"{model_dir}/{run_name}/{run_name}_{width}{L1_penalty}/{tokens}_toks.pt"
+        model = CrossCoder.from_pretrained(path)
+        tok_string = f"{tokens // 1e6}M tokens"
+        plot_norm_hist(model, f"{width} {L1_penalty} {tok_string}", ax=ax, fig=fig)
+
+    plt.savefig("norm_hist.png", dpi=300)
+    return fig, axes
+
+
+plot_norm_hist_grid(
+    "/scratch/cdumas/mva/models",
+    "1741001799_ultramarine-camel",
+    tokens=[3_001_344, 10_004_480, 34_015_232, 50_000_896],
+)
 # %%
