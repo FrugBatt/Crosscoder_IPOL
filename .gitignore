@@ -1,3 +1,8 @@
+checkpoints/
+models/
+wandb/
+demo_failure.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -171,4 +176,3 @@ cython_debug/
 .pypirc
 
 output.html
-train.py
