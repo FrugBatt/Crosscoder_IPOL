@@ -10,7 +10,7 @@ import numpy as np
 import torch as th
 from tqdm.auto import tqdm
 
-plt.rcParams["text.usetex"] = True
+plt.rcParams["text.usetex"] = False
 plt.rcParams.update({"font.size": 20})
 mpl.rcParams["text.latex.preamble"] = r"\usepackage{amsmath}"
 
