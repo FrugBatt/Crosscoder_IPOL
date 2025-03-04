@@ -1,6 +1,12 @@
 import torch as th
 from nnterp.nnsight_utils import get_layer_output, get_layer
-from tiny_dashboard.html_utils import create_highlighted_tokens_html, create_example_html, create_base_html
+from tiny_dashboard.html_utils import (
+    create_highlighted_tokens_html,
+    create_example_html,
+    create_base_html,
+)
+from plots import plot_norm_hist
+
 
 class Experiment:
 
@@ -32,13 +38,23 @@ class Experiment:
         self.layer = collect_layer
         self.max_acts = max_acts
 
+    def plot_norm_hist(self):
+        fig, ax = plot_norm_hist(
+            self.crosscoder, "32k latents, 5e-2 L1 penalty, 50M tokens"
+        )
+        return fig, ax
+
     @th.no_grad()
     def get_feature_activation(
         self, text: str, feature_indices: tuple[int, ...]
     ) -> th.Tensor:
         """Get the activation values for given features by combining base and instruct model activations"""
-        with self.instruct_model.trace(text):  # self.model is the instruct_model from parent
-            instruct_activations = get_layer_output(self.instruct_model, self.layer)[0].save()
+        with self.instruct_model.trace(
+            text
+        ):  # self.model is the instruct_model from parent
+            instruct_activations = get_layer_output(self.instruct_model, self.layer)[
+                0
+            ].save()
             get_layer(self.instruct_model, self.layer).output.stop()
 
         with self.base_model.trace(text):
@@ -54,7 +70,7 @@ class Experiment:
             cc_input, select_features=list(feature_indices)
         )
         return features_acts
-    
+
     def _create_html_highlight(
         self,
         tokens: list[str],
@@ -112,7 +128,9 @@ class Experiment:
         )
 
     def run(self, text, feature_indices, highlight_features, tooltip_features):
-        features = list(dict.fromkeys(highlight_features + tooltip_features + feature_indices))
+        features = list(
+            dict.fromkeys(highlight_features + tooltip_features + feature_indices)
+        )
 
         tokens = self.tokenizer.tokenize(text, add_special_tokens=True)
 
@@ -129,12 +147,9 @@ class Experiment:
             return_max_acts=True,
         )
 
-
-        example_html = create_example_html(
-                    max_acts_str, html_content, static=True
-                )
+        example_html = create_example_html(max_acts_str, html_content, static=True)
 
         html = create_base_html(title="hello", content=example_html)
-        
+
         # print(example_html)
         return html

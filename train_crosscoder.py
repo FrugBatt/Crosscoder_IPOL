@@ -4,7 +4,7 @@ import json
 import torch as th
 from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import gc
 from nnterp.nnsight_utils import get_layer, get_layer_output
 from crosscoder import CrossCoder
@@ -14,8 +14,12 @@ from coolname import generate_slug
 from time import time
 import multiprocessing as mp
 from queue import Empty
+import signal
+import sys
+import atexit
 
 
+@th.no_grad()
 def get_activations(prompts, base_model, chat_model, layer=14):
     toks = chat_model.tokenizer.apply_chat_template(
         prompts,
@@ -25,7 +29,11 @@ def get_activations(prompts, base_model, chat_model, layer=14):
         max_length=1024,
         return_dict=True,
     )
-    attn_mask = toks.attention_mask.bool()
+    # mask out the bos token
+    attn_mask = toks.attention_mask.bool().clone()
+    first_ones = (attn_mask == 1).float().argmax(dim=1)
+    batch_idx = th.arange(attn_mask.shape[0])
+    attn_mask[batch_idx, first_ones] = False
     with chat_model.trace(toks):
         chat_out = get_layer_output(chat_model, layer)[attn_mask].save()
         get_layer(chat_model, layer).output.stop()
@@ -34,7 +42,13 @@ def get_activations(prompts, base_model, chat_model, layer=14):
         get_layer(base_model, layer).output.stop()
     # activations: (batch_size, seq_len, d), with mask: (num_acts, d)
     # return (num_acts,2, d)
-    return th.cat([base_out.unsqueeze(1), chat_out.unsqueeze(1)], dim=1)
+    acts = th.cat([base_out.unsqueeze(1), chat_out.unsqueeze(1)], dim=1)
+    assert acts.shape == (
+        attn_mask.sum().item(),
+        2,
+        chat_model._model.config.hidden_size,
+    ), f"acts.shape: {acts.shape} != {(attn_mask.sum().item(), 2, chat_model._model.config.hidden_size)}"
+    return acts
 
 
 class IndexableDataset(th.utils.data.Dataset):
@@ -281,9 +295,11 @@ def get_stats(crosscoder, batch, return_alive=False):
     """
     with th.no_grad():
         x_hat, features = crosscoder(batch, output_features=True)
-
+        assert features.shape[0] == batch.shape[0]
         # L0 (features/sample)
-        l0 = (features != 0).float().sum(dim=-1).mean().item()
+        l0 = (features > 1e-4).float().sum(dim=-1).mean(dim=0).item()
+
+        l1 = features.abs().sum(dim=-1).mean().item()
 
         # Fraction of dead features
         alive = (features > 1e-4).any(dim=0)
@@ -293,7 +309,8 @@ def get_stats(crosscoder, batch, return_alive=False):
 
         stats = {
             "l0": l0,
-            "frac_deads": frac_deads,
+            "l1": l1,
+            "frac_deads_batch": frac_deads,
             "loss": th.nn.MSELoss()(x_hat, batch).item(),
         }
 
@@ -353,6 +370,8 @@ def wandb_logger_process(config, log_queue, stop_event):
 class WandbLogger:
     """Handles wandb logging in a separate process."""
 
+    _instances = []  # Class variable to track all instances
+
     def __init__(self, config):
         self.log_queue = mp.Queue()
         self.stop_event = mp.Event()
@@ -360,324 +379,388 @@ class WandbLogger:
             target=wandb_logger_process, args=(config, self.log_queue, self.stop_event)
         )
         self.process.start()
+        WandbLogger._instances.append(self)  # Add instance to tracking list
 
     def log(self, metrics, step=None):
         """Send metrics to the logger process."""
-        self.log_queue.put({"data": metrics, "step": step})
+        try:
+            self.log_queue.put({"data": metrics, "step": step})
+        except:
+            # If queue is closed or process is dead, ignore
+            pass
 
     def finish(self):
         """Stop the logger process."""
-        self.stop_event.set()
-        self.process.join()
+        try:
+            self.stop_event.set()
+            self.process.join(timeout=5)  # Wait up to 5 seconds
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=1)  # Give it another second
+                if self.process.is_alive():
+                    self.process.kill()  # Force kill if still alive
+        except:
+            pass  # Ignore errors during cleanup
+        finally:
+            if self in WandbLogger._instances:
+                WandbLogger._instances.remove(self)
+
+    @classmethod
+    def cleanup_all(cls):
+        """Class method to cleanup all instances."""
+        for instance in cls._instances[:]:  # Create a copy of the list to iterate
+            instance.finish()
 
 
-def train_crosscoder(training_config, coder_configs, buffer, validation_buffer=None):
+def signal_handler(signum, frame):
+    """Handle termination signals by cleaning up processes."""
+    print("\nReceived termination signal. Cleaning up...")
+    WandbLogger.cleanup_all()
+    sys.exit(1)
+
+
+# Register cleanup functions
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(WandbLogger.cleanup_all)
+
+
+def train_crosscoder(
+    training_config, coder_configs, buffer, validation_buffer=None, use_norm_loss=True
+):
     """Train multiple CrossCoder models with the given configurations and data buffers in parallel."""
-    device = training_config.device
-    models = []
-    optimizers = []
-    schedulers = []
-    steps_since_active_list = []
-    wandb_loggers = []
+    try:
+        device = training_config.device
+        models = []
+        optimizers = []
+        schedulers = []
+        steps_since_active_list = []
+        wandb_loggers = []
 
-    # Initialize all models, optimizers, and schedulers
-    for coder_config in coder_configs:
-        print(f"\nInitializing CrossCoder model: {coder_config.name}")
+        # Initialize all models, optimizers, and schedulers
+        for coder_config in coder_configs:
+            print(f"\nInitializing CrossCoder model: {coder_config.name}")
 
-        # Initialize wandb logger
-        if training_config.use_wandb:
-            wandb_config = {
-                "project": training_config.wandb_project,
-                "entity": training_config.wandb_entity,
-                "name": (
-                    f"{training_config.wandb_run_name}_{coder_config.name}"
-                    if training_config.wandb_run_name
-                    else coder_config.name
-                ),
-                "config": {
-                    "activation_dim": coder_config.activation_dim,
-                    "dict_size": coder_config.dict_size,
-                    "num_layers": coder_config.num_layers,
-                    "lr": training_config.lr,
-                    "l1_penalty": coder_config.l1_penalty,
-                    "warmup_steps": training_config.warmup_steps,
-                    "resample_steps": training_config.resample_steps,
-                    "batch_size": training_config.batch_size,
-                    "buffer_size": training_config.buffer_size,
-                    "layer": training_config.layer,
-                },
-                "group": (
-                    training_config.wandb_run_name
-                    if training_config.wandb_run_name
-                    else None
-                ),
-            }
-            logger = WandbLogger(wandb_config)
-            wandb_loggers.append(logger)
+            # Initialize wandb logger
+            if training_config.use_wandb:
+                wandb_config = {
+                    "project": training_config.wandb_project,
+                    "entity": training_config.wandb_entity,
+                    "name": (
+                        f"{training_config.wandb_run_name}_{coder_config.name}"
+                        if training_config.wandb_run_name
+                        else coder_config.name
+                    ),
+                    "config": {
+                        "activation_dim": coder_config.activation_dim,
+                        "dict_size": coder_config.dict_size,
+                        "num_layers": coder_config.num_layers,
+                        "lr": training_config.lr,
+                        "l1_penalty": coder_config.l1_penalty,
+                        "warmup_steps": training_config.warmup_steps,
+                        "resample_steps": training_config.resample_steps,
+                        "batch_size": training_config.batch_size,
+                        "buffer_size": training_config.buffer_size,
+                        "layer": training_config.layer,
+                    },
+                    "group": (
+                        training_config.wandb_run_name
+                        if training_config.wandb_run_name
+                        else None
+                    ),
+                }
+                logger = WandbLogger(wandb_config)
+                wandb_loggers.append(logger)
 
-        # Initialize CrossCoder model
-        crosscoder = CrossCoder(
-            coder_config.activation_dim,
-            coder_config.dict_size,
-            coder_config.num_layers,
-            same_init_for_all_layers=coder_config.same_init_for_all_layers,
-            norm_init_scale=coder_config.norm_init_scale,
-            init_with_transpose=coder_config.init_with_transpose,
-        ).to(device)
-        models.append(crosscoder)
+            # Initialize CrossCoder model
+            crosscoder = CrossCoder(
+                coder_config.activation_dim,
+                coder_config.dict_size,
+                coder_config.num_layers,
+                same_init_for_all_layers=coder_config.same_init_for_all_layers,
+                norm_init_scale=coder_config.norm_init_scale,
+                init_with_transpose=coder_config.init_with_transpose,
+            ).to(device)
+            models.append(crosscoder)
 
-        # Initialize optimizer
-        optimizer = th.optim.Adam(crosscoder.parameters(), lr=training_config.lr)
-        optimizers.append(optimizer)
+            # Initialize optimizer
+            optimizer = th.optim.Adam(crosscoder.parameters(), lr=training_config.lr)
+            optimizers.append(optimizer)
 
-        # Initialize scheduler
-        def warmup_fn(step):
-            if training_config.resample_steps is None:
-                return min(step / training_config.warmup_steps, 1.0)
-            else:
-                return min(
-                    (step % training_config.resample_steps)
-                    / training_config.warmup_steps,
-                    1.0,
-                )
-
-        scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_fn)
-        schedulers.append(scheduler)
-
-        # Initialize steps_since_active if using resampling
-        if training_config.resample_steps is not None:
-            steps_since_active = th.zeros(coder_config.dict_size, dtype=int).to(device)
-            steps_since_active_list.append(steps_since_active)
-
-    # Initialize training loop variables
-    step = 0
-    num_tokens = 0
-    all_stats = [{"train_losses": [], "val_metrics": []} for _ in models]
-
-    # Load checkpoint if resuming
-    if training_config.resume_from and training_config.resume_from.exists():
-        checkpoint_path = training_config.resume_from / "latest.pt"
-        if checkpoint_path.exists():
-            step, num_tokens, loaded_steps_since_active, loaded_stats = load_checkpoint(
-                checkpoint_path, models, optimizers, schedulers, device
-            )
-            if loaded_steps_since_active is not None:
-                steps_since_active_list = loaded_steps_since_active
-            all_stats = loaded_stats
-            print(f"Resumed training from step {step} ({num_tokens} tokens)")
-
-    # Main training loop
-    pbar = tqdm(
-        total=training_config.max_tokens, initial=num_tokens, desc="Training all models"
-    )
-    loss_fn = th.nn.MSELoss()
-
-    while num_tokens < training_config.max_tokens:
-        # Get batch and move to device
-        batch = next(buffer).to(device)
-        batch_tokens = batch.shape[0]
-        num_tokens += batch_tokens
-
-        # Train all models in parallel
-        for i, (model, optimizer, scheduler, coder_config) in enumerate(
-            zip(models, optimizers, schedulers, coder_configs)
-        ):
-            model.train()
-            optimizer.zero_grad()
-
-            # Forward pass
-            x_hat, features = model(batch, output_features=True)
-
-            # Compute loss
-            l2_loss = loss_fn(x_hat, batch)
-            l1_loss = coder_config.l1_penalty * features.norm(p=1, dim=-1).mean()
-            loss = l2_loss + l1_loss
-
-            # Backward and optimize
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            # Log training metrics
-            if training_config.use_wandb and step % 10 == 0:
-                if len(batch) > 1:
-                    train_stats = get_stats(model, batch)
-                    wandb_loggers[i].log(
-                        {
-                            "train/loss": loss.item(),
-                            "train/l2_loss": l2_loss.item(),
-                            "train/l1_loss": l1_loss.item(),
-                            "train/learning_rate": scheduler.get_last_lr()[0],
-                            "train/l0": train_stats["l0"],
-                            "train/frac_deads": train_stats["frac_deads"],
-                            "train/frac_variance_explained": train_stats[
-                                "frac_variance_explained"
-                            ],
-                        },
-                        step=step,
+            # Initialize scheduler
+            def warmup_fn(step):
+                if training_config.resample_steps is None:
+                    return min(step / training_config.warmup_steps, 1.0)
+                else:
+                    return min(
+                        (step % training_config.resample_steps)
+                        / training_config.warmup_steps,
+                        1.0,
                     )
 
-            # Handle dead neurons and resampling
+            scheduler = th.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_fn)
+            schedulers.append(scheduler)
+
+            # Initialize steps_since_active if using resampling
             if training_config.resample_steps is not None:
-                deads = (features <= 1e-4).all(dim=0)
-                steps_since_active_list[i][deads] += 1
-                steps_since_active_list[i][~deads] = 0
+                steps_since_active = th.zeros(coder_config.dict_size, dtype=int).to(
+                    device
+                )
+                steps_since_active_list.append(steps_since_active)
 
-                if step % 50 == 0:
-                    dead_count = (
-                        (
-                            steps_since_active_list[i]
-                            > training_config.resample_steps // 2
-                        )
-                        .sum()
-                        .item()
+        # Initialize training loop variables
+        step = 0
+        num_tokens = 0
+        all_stats = [{"train_losses": [], "val_metrics": []} for _ in models]
+
+        # Load checkpoint if resuming
+        if training_config.resume_from and training_config.resume_from.exists():
+            checkpoint_path = training_config.resume_from / "latest.pt"
+            if checkpoint_path.exists():
+                step, num_tokens, loaded_steps_since_active, loaded_stats = (
+                    load_checkpoint(
+                        checkpoint_path, models, optimizers, schedulers, device
                     )
-                    if i == 0:  # Update progress bar with first model's stats
-                        pbar.set_postfix(
+                )
+                if loaded_steps_since_active is not None:
+                    steps_since_active_list = loaded_steps_since_active
+                all_stats = loaded_stats
+                print(f"Resumed training from step {step} ({num_tokens} tokens)")
+
+        # Main training loop
+        pbar = tqdm(
+            total=training_config.max_tokens,
+            initial=num_tokens,
+            desc="Training all models",
+        )
+
+        while num_tokens < training_config.max_tokens:
+            # Get batch and move to device
+            batch = next(buffer).to(device)
+            batch_tokens = batch.shape[0]
+            num_tokens += batch_tokens
+
+            # Train all models in parallel
+            for i, (model, optimizer, scheduler, coder_config) in enumerate(
+                zip(models, optimizers, schedulers, coder_configs)
+            ):
+                model.train()
+                optimizer.zero_grad()
+
+                # Forward pass
+                x_hat, features = model(batch, output_features=True)
+
+                # Compute loss
+                assert x_hat.shape == batch.shape
+                mse_loss = (batch - x_hat).pow(2).sum(dim=-1).mean()
+                norm_loss = (batch - x_hat).norm(dim=-1).mean()
+                l1_loss = coder_config.l1_penalty * features.sum(dim=-1).mean(dim=0)
+                recon_loss = norm_loss if use_norm_loss else mse_loss
+                loss = recon_loss + l1_loss
+
+                # Backward and optimize
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                # Log training metrics
+                if training_config.use_wandb and step % 10 == 0:
+                    if len(batch) > 1:
+                        train_stats = get_stats(model, batch)
+                        wandb_loggers[i].log(
                             {
-                                "loss": f"{loss.item():.4f}",
-                                "dead": f"{dead_count}/{coder_config.dict_size}",
-                            }
+                                "train/loss": loss.item(),
+                                "train/mse_loss": mse_loss.item(),
+                                "train/norm_loss": norm_loss.item(),
+                                "train/l1_loss": l1_loss.item(),
+                                "train/learning_rate": scheduler.get_last_lr()[0],
+                                "train/l0": train_stats["l0"],
+                                "train/frac_deads_batch": train_stats[
+                                    "frac_deads_batch"
+                                ],
+                                "train/frac_variance_explained": train_stats[
+                                    "frac_variance_explained"
+                                ],
+                            },
+                            step=step,
                         )
 
-                # Perform neuron resampling
-                if step % training_config.resample_steps == 0 and step > 0:
-                    dead_mask = (
-                        steps_since_active_list[i] > training_config.resample_steps // 2
-                    )
-                    if dead_mask.sum() > 0:
-                        print(
-                            f"\nResampling {dead_mask.sum().item()} neurons at step {step} for model {coder_config.name}"
-                        )
-                        model.resample_neurons(dead_mask, batch)
+                # Handle dead neurons and resampling
+                if training_config.resample_steps is not None:
+                    deads = (features <= 1e-4).all(dim=0)
+                    steps_since_active_list[i][deads] += 1
+                    steps_since_active_list[i][~deads] = 0
 
-                        if training_config.use_wandb:
-                            wandb_loggers[i].log(
-                                {"train/resampled_neurons": dead_mask.sum().item()},
-                                step=step,
+                    if step % 50 == 0:
+                        dead_count = (
+                            (
+                                steps_since_active_list[i]
+                                > training_config.resample_steps // 2
                             )
-            elif (
-                step % 50 == 0 and i == 0
-            ):  # Update progress bar with first model's stats
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                            .sum()
+                            .item()
+                        )
+                        if i == 0:  # Update progress bar with first model's stats
+                            pbar.set_postfix(
+                                {
+                                    "loss": f"{loss.item():.4f}",
+                                    "dead": f"{dead_count}/{coder_config.dict_size}",
+                                }
+                            )
 
-        # Save checkpoint based on tokens
-        tokens_since_checkpoint = num_tokens - training_config.last_checkpoint_tokens
-        if tokens_since_checkpoint >= training_config.checkpoint_every:
-            checkpoint_dir = training_config.checkpoint_dir
-            save_checkpoint(
-                checkpoint_dir,
-                step,
-                num_tokens,
-                models,
-                optimizers,
-                schedulers,
-                steps_since_active_list,
-                all_stats,
-                coder_configs,
-                training_config,
-            )
-            training_config.last_checkpoint_tokens = num_tokens
-
-        # Validation based on tokens
-        tokens_since_validation = num_tokens - training_config.last_validation_tokens
-        if (
-            validation_buffer is not None
-            and tokens_since_validation >= training_config.validate_every
-            and num_tokens > 0
-        ):
-            print(f"\nRunning validation at {num_tokens} tokens...")
-
-            for i, (model, coder_config) in enumerate(zip(models, coder_configs)):
-                model.eval()
-                val_stats = defaultdict(list)
-                alive = None
-
-                with th.no_grad():
-                    num_tokens_val = 0
-                    while num_tokens_val < training_config.max_tokens_val:
-                        try:
-                            val_batch = next(validation_buffer).to(device)
-                            # print(val_batch.shape, num_tokens_val)
-                            if len(val_batch) > 1:
-                                batch_stats = get_stats(
-                                    model, val_batch, return_alive=True
+                        # Perform neuron resampling
+                        if step % training_config.resample_steps == 0 and step > 0:
+                            dead_mask = (
+                                steps_since_active_list[i]
+                                > training_config.resample_steps // 2
+                            )
+                            if dead_mask.sum() > 0:
+                                print(
+                                    f"\nResampling {dead_mask.sum().item()} neurons at step {step} for model {coder_config.name}"
                                 )
+                                model.resample_neurons(dead_mask, batch)
 
-                                for k, v in batch_stats.items():
-                                    if k != "alive":
-                                        val_stats[k].append(v)
-                                    else:
-                                        if alive is None:
-                                            alive = v
+                                if training_config.use_wandb:
+                                    wandb_loggers[i].log(
+                                        {
+                                            "train/resampled_neurons": dead_mask.sum().item()
+                                        },
+                                        step=step,
+                                    )
+                elif (
+                    step % 50 == 0 and i == 0
+                ):  # Update progress bar with first model's stats
+                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+            # Save checkpoint based on tokens
+            tokens_since_checkpoint = (
+                num_tokens - training_config.last_checkpoint_tokens
+            )
+            if tokens_since_checkpoint >= training_config.checkpoint_every:
+                checkpoint_dir = training_config.checkpoint_dir
+                save_checkpoint(
+                    checkpoint_dir,
+                    step,
+                    num_tokens,
+                    models,
+                    optimizers,
+                    schedulers,
+                    steps_since_active_list,
+                    all_stats,
+                    coder_configs,
+                    training_config,
+                )
+                training_config.last_checkpoint_tokens = num_tokens
+
+            # Validation based on tokens
+            tokens_since_validation = (
+                num_tokens - training_config.last_validation_tokens
+            )
+            if (
+                validation_buffer is not None
+                and tokens_since_validation >= training_config.validate_every
+                and num_tokens > 0
+            ):
+                print(f"\nRunning validation at {num_tokens} tokens...")
+
+                for i, (model, coder_config) in enumerate(zip(models, coder_configs)):
+                    model.eval()
+                    val_stats = defaultdict(list)
+                    alive = None
+
+                    with th.no_grad():
+                        num_tokens_val = 0
+                        while num_tokens_val < training_config.max_tokens_val:
+                            try:
+                                val_batch = next(validation_buffer).to(device)
+                                # print(val_batch.shape, num_tokens_val)
+                                if len(val_batch) > 1:
+                                    batch_stats = get_stats(
+                                        model, val_batch, return_alive=True
+                                    )
+
+                                    for k, v in batch_stats.items():
+                                        if k != "alive":
+                                            val_stats[k].append(v)
                                         else:
-                                            alive = alive | v
-                                num_tokens_val += val_batch.shape[0]
-                        except StopIteration:
-                            break
+                                            if alive is None:
+                                                alive = v
+                                            else:
+                                                alive = alive | v
+                                    num_tokens_val += val_batch.shape[0]
+                            except StopIteration:
+                                break
 
-                # Average validation metrics
-                avg_val_stats = {k: np.mean(v) for k, v in val_stats.items()}
-                all_stats[i]["val_metrics"].append(avg_val_stats)
+                    # Average validation metrics
+                    avg_val_stats = {k: np.mean(v) for k, v in val_stats.items()}
+                    all_stats[i]["val_metrics"].append(avg_val_stats)
 
-                # Log validation metrics
-                if training_config.use_wandb:
-                    wandb_loggers[i].log(
-                        {
-                            "val/l2_loss": avg_val_stats["loss"],
-                            "val/l0": avg_val_stats["l0"],
-                            "val/frac_deads": avg_val_stats["frac_deads"],
-                            "val/frac_variance_explained": avg_val_stats[
-                                "frac_variance_explained"
-                            ],
-                            "val/frac_dead": (~alive).float().mean().item(),
-                        },
-                        step=step,
+                    # Log validation metrics
+                    if training_config.use_wandb:
+                        wandb_loggers[i].log(
+                            {
+                                "val/l2_loss": avg_val_stats["loss"],
+                                "val/l0": avg_val_stats["l0"],
+                                "val/frac_deads_batch": avg_val_stats[
+                                    "frac_deads_batch"
+                                ],
+                                "val/frac_variance_explained": avg_val_stats[
+                                    "frac_variance_explained"
+                                ],
+                                "val/frac_dead": (~alive).float().mean().item(),
+                            },
+                            step=step,
+                        )
+
+                    # Print validation results
+                    print(f"\nModel: {coder_config.name}")
+                    print(f"  L2 loss = {avg_val_stats['loss']:.6f}")
+                    print(
+                        f"  Variance explained = {avg_val_stats['frac_variance_explained']:.2%}"
+                    )
+                    print(f"  L0 (features/sample) = {avg_val_stats['l0']:.1f}")
+                    print(
+                        f"  Fraction of dead features = {avg_val_stats['frac_deads_batch']:.2%}"
                     )
 
-                # Print validation results
-                print(f"\nModel: {coder_config.name}")
-                print(f"  L2 loss = {avg_val_stats['loss']:.6f}")
-                print(
-                    f"  Variance explained = {avg_val_stats['frac_variance_explained']:.2%}"
-                )
-                print(f"  L0 (features/sample) = {avg_val_stats['l0']:.1f}")
-                print(
-                    f"  Fraction of dead features = {avg_val_stats['frac_deads']:.2%}"
-                )
+                training_config.last_validation_tokens = num_tokens
 
-            training_config.last_validation_tokens = num_tokens
+            step += 1
+            pbar.update(batch_tokens)
 
-        step += 1
-        pbar.update(batch_tokens)
+        pbar.close()
 
-    pbar.close()
+        # Save final checkpoint
+        checkpoint_dir = (
+            training_config.checkpoint_dir / f"run_{training_config.wandb_run_name}"
+            if training_config.wandb_run_name
+            else training_config.checkpoint_dir
+        )
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            num_tokens,
+            models,
+            optimizers,
+            schedulers,
+            steps_since_active_list,
+            all_stats,
+            coder_configs,
+            training_config,
+        )
 
-    # Save final checkpoint
-    checkpoint_dir = (
-        training_config.checkpoint_dir / f"run_{training_config.wandb_run_name}"
-        if training_config.wandb_run_name
-        else training_config.checkpoint_dir
-    )
-    save_checkpoint(
-        checkpoint_dir,
-        step,
-        num_tokens,
-        models,
-        optimizers,
-        schedulers,
-        steps_since_active_list,
-        all_stats,
-        coder_configs,
-        training_config,
-    )
+        # Clean up wandb loggers
+        if training_config.use_wandb:
+            for logger in wandb_loggers:
+                logger.finish()
 
-    # Clean up wandb loggers
-    if training_config.use_wandb:
-        for logger in wandb_loggers:
-            logger.finish()
-
-    return models, all_stats
+            return models, all_stats
+    except Exception as e:
+        print(f"\nTraining failed with error: {str(e)}")
+        # Ensure cleanup happens
+        raise  # Re-raise the exception after cleanup
+    finally:
+        WandbLogger.cleanup_all()
 
 
 def save_checkpoint(
@@ -928,55 +1011,17 @@ if __name__ == "__main__":
         help="Save checkpoint every N tokens",
     )
     parser.add_argument(
-        "--resume-from", type=str, help="Path to checkpoint directory to resume from"
+        "--resume-from",
+        type=str,
+        help="Path to checkpoint directory to resume from",
     )
 
     args = parser.parse_args()
     run_name = str(int(time())) + "_" + generate_slug(2)
 
-    # Modify parameters if in test mode
-    if args.test:
-        args.max_tokens = 1000
-        args.max_tokens_val = 100
-        args.validate_every = 500  # Validate every 500 tokens in test mode
-        args.checkpoint_every = 200  # Checkpoint every 200 tokens in test mode
-        args.buffer_size = 1000
-        run_name = "test_" + run_name
-        print("Running in test mode with reduced parameters")
-
-    # Set device
-    if args.device is None:
-        args.device = "cuda" if th.cuda.is_available() else "cpu"
-
-    print(f"Loading models from {args.base_model_name} and {args.chat_model_name}...")
-
     # Initialize models
     base_model = load_model(args.base_model_name, torch_dtype=th.float32)
     chat_model = load_model(args.chat_model_name, torch_dtype=th.float32)
-
-    # Load dataset
-    print("Loading dataset...")
-    dataset = load_dataset("lmsys/lmsys-chat-1m", split="train")["conversation"]
-
-    # Create training configuration
-    training_config = TrainingConfig(
-        lr=args.lr,
-        batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
-        refresh_batch_size=args.refresh_batch_size,
-        max_tokens=args.max_tokens,
-        max_tokens_val=args.max_tokens_val,
-        validate_every=args.validate_every,
-        layer=args.layer,
-        device=args.device,
-        checkpoint_dir=args.checkpoint_dir,
-        checkpoint_every=args.checkpoint_every,
-        resume_from=args.resume_from,
-        run_name=run_name,
-        wandb_project="crosscoder-ipol-test" if args.test else "crosscoder-ipol",
-    )
-
-    # Create multiple coder configurations for different experiments
     activation_dim = chat_model._model.config.hidden_size
     coder_configs = [
         CoderConfig(
@@ -1008,6 +1053,61 @@ if __name__ == "__main__":
             name=f"{run_name}_32k5e-2",
         ),
     ]
+    # Modify parameters if in test mode
+    if args.test:
+        args.max_tokens = 100_000
+        args.max_tokens_val = 100_000
+        args.validate_every = 10_000  # Validate every 500 tokens in test mode
+        args.checkpoint_every = 30_000  # Checkpoint every 200 tokens in test mode
+        args.buffer_size = 100_000
+        run_name = "test_" + run_name
+        coder_configs = [
+            CoderConfig(
+                activation_dim=activation_dim,
+                dict_size=16000,
+                num_layers=2,
+                l1_penalty=3e-2,
+                name=f"{run_name}_16k3e-2",
+            ),
+            CoderConfig(
+                activation_dim=activation_dim,
+                dict_size=32000,
+                num_layers=2,
+                l1_penalty=0,
+                name=f"{run_name}_32knosparsity",
+            ),
+        ]
+        print("Running in test mode with reduced parameters")
+
+    # Set device
+    if args.device is None:
+        args.device = "cuda" if th.cuda.is_available() else "cpu"
+
+    print(f"Loading models from {args.base_model_name} and {args.chat_model_name}...")
+
+    # Load dataset
+    print("Loading dataset...")
+    dataset = load_dataset("lmsys/lmsys-chat-1m", split="train")["conversation"]
+
+    # Create training configuration
+    training_config = TrainingConfig(
+        lr=args.lr,
+        batch_size=args.batch_size,
+        buffer_size=args.buffer_size,
+        refresh_batch_size=args.refresh_batch_size,
+        max_tokens=args.max_tokens,
+        max_tokens_val=args.max_tokens_val,
+        validate_every=args.validate_every,
+        layer=args.layer,
+        device=args.device,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every=args.checkpoint_every,
+        resume_from=args.resume_from,
+        run_name=run_name,
+        wandb_project="crosscoder-ipol-test" if args.test else "crosscoder-ipol",
+    )
+
+    # Create multiple coder configurations for different experiments
 
     th.manual_seed(args.seed)
     np.random.seed(args.seed)

@@ -241,7 +241,7 @@ class CrossCoder(PyTorchModelHubMixin, nn.Module):
         Load a pretrained cross-coder from a file.
         """
         if from_hub:
-            return super().from_pretrained(path, device=device, dtype=dtype, **kwargs)
+            return super().from_pretrained(path, **kwargs).to(device=device, dtype=dtype)
 
         state_dict = th.load(path, map_location="cpu", weights_only=True)
         if "encoder.weight" not in state_dict:
