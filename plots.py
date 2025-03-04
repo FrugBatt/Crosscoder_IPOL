@@ -121,78 +121,77 @@ def plot_norm_hist_grid(
     plt.savefig("norm_hist.png", dpi=300)
     return fig, axes
 
-
-_ = plot_norm_hist_grid(
-    "/scratch/cdumas/mva/tests/models",
-    "1741043371_vegan-ladybug",
-    tokens=[3_001_344, 10_004_480, 34_015_232, 50_000_896],
-)
+if __name__ == "__main__":
+    _ = plot_norm_hist_grid(
+        "/scratch/cdumas/mva/tests/models",
+        "1741043371_vegan-ladybug",
+        tokens=[3_001_344, 10_004_480, 34_015_232, 50_000_896],
+    )
 
 # %%
 
-path = path_from_params(
-    save_path="/scratch/cdumas/mva/tests/models",
-    run_name="1741043371_vegan-ladybug",
-    tokens = 50000896,
-    width=32,
-    L1_penalty="5e-2",
-)
-model = CrossCoder.from_pretrained(path)
-# %%
-from huggingface_hub import HfApi
+    path = path_from_params(
+        save_path="/scratch/cdumas/mva/tests/models",
+        run_name="1741043371_vegan-ladybug",
+        tokens = 50000896,
+        width=32,
+        L1_penalty="5e-2",
+    )
+    model = CrossCoder.from_pretrained(path)
+    # %%
+    from huggingface_hub import HfApi
 
-repo_id = "Butanium/crosscoder-Qwen2.5-0.5B-Instruct-and-Base-32k5e-2-50M-toks-73L0-0.84FVE"
-api = HfApi()
+    repo_id = "Butanium/crosscoder-Qwen2.5-0.5B-Instruct-and-Base-32k5e-2-50M-toks-73L0-0.84FVE"
+    api = HfApi()
 
-api.create_repo(repo_id=repo_id, repo_type="model")
+    api.create_repo(repo_id=repo_id, repo_type="model")
 
-api.upload_file(
-    path_or_fileobj=path,
-    path_in_repo="pytorch_model.bin",
-    repo_id=repo_id,
-    repo_type="model",
-    commit_message="Added crosscoder weights",
-)
-# %%
-import tempfile
-import json
-import os
-
-with tempfile.TemporaryDirectory() as directory:
-    path = os.path.join(directory, "config.json")
-    json_dict = {
-        "model_type": "crosscoder",
-        "model_0": "Qwen2.5-0.5B",
-        "model_1": "Qwen2.5-0.5B-Instruct",
-        "activation_dim": model.decoder.weight.shape[2],
-        "dict_size": model.decoder.weight.shape[1],
-        "num_layers": 2,
-        "mu": 5e-2,
-        "learning_rate": 1e-4,
-        "batch_size": 1024,
-        "dataset": "lmsys/lmsys-chat-1m",
-        "num_tokens": 50_000_896,
-        "width": 32000,
-        "L1_penalty": 5e-2,
-        "l0_validation": 73,
-        "frac_var_explained_validation": 0.84,
-        "dead_latents_validation": 1050,
-    }
-    with open(path, "w") as f:
-        json.dump(json_dict, f)
     api.upload_file(
         path_or_fileobj=path,
-        path_in_repo="config.json",
+        path_in_repo="pytorch_model.bin",
         repo_id=repo_id,
         repo_type="model",
-        commit_message="Added crosscoder config",
+        commit_message="Added crosscoder weights",
     )
-# %%
-model.decoder.weight.shape
-# %%
-from crosscoder import CrossCoder
+    # %%
+    import tempfile
+    import json
+    import os
 
-hf_model = CrossCoder.from_pretrained(
-    "Butanium/crosscoder-Qwen2.5-0.5B-Instruct-and-Base-32k5e-2-50M-toks-73L0-0.84FVE", from_hub=True
-)
-# %%
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "config.json")
+        json_dict = {
+            "model_type": "crosscoder",
+            "model_0": "Qwen2.5-0.5B",
+            "model_1": "Qwen2.5-0.5B-Instruct",
+            "activation_dim": model.decoder.weight.shape[2],
+            "dict_size": model.decoder.weight.shape[1],
+            "num_layers": 2,
+            "mu": 5e-2,
+            "learning_rate": 1e-4,
+            "batch_size": 1024,
+            "dataset": "lmsys/lmsys-chat-1m",
+            "num_tokens": 50_000_896,
+            "width": 32000,
+            "L1_penalty": 5e-2,
+            "l0_validation": 73,
+            "frac_var_explained_validation": 0.84,
+            "dead_latents_validation": 1050,
+        }
+        with open(path, "w") as f:
+            json.dump(json_dict, f)
+        api.upload_file(
+            path_or_fileobj=path,
+            path_in_repo="config.json",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message="Added crosscoder config",
+        )
+    # %%
+    # %%
+    from crosscoder import CrossCoder
+
+    hf_model = CrossCoder.from_pretrained(
+        "Butanium/crosscoder-Qwen2.5-0.5B-Instruct-and-Base-32k5e-2-50M-toks-73L0-0.84FVE", from_hub=True
+    )
+    # %%
