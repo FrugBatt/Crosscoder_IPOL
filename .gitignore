@@ -176,3 +176,4 @@ cython_debug/
 .pypirc
 
 output.html
+output_plot.png

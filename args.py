@@ -9,6 +9,7 @@ def get_config():
     parser.add_argument('--base_model_name', type=str, default="Qwen/Qwen2.5-0.5B", help='The base model name')
     parser.add_argument('--chat_model_name', type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help='The chat model name')
     parser.add_argument('--output_file', type=str, default='output.html', help='The output file')
+    parser.add_argument('--output_plot', type=str, default='output_plot.png', help='The output plot')
     parser.add_argument('--prompt', type=str, default='What is the capital of France?', help='The prompt')
     parser.add_argument('--features_compute', type=str, help='The features to compute')
     parser.add_argument('--highlight_features', type=str, help='The features to highlight')
@@ -48,6 +49,7 @@ def get_config():
         'chat_model_name': args.chat_model_name,
         # 'output_file': os.path.join(ROOT, args.output_file),
         'output_file': args.output_file,
+        'output_plot': args.output_plot,
         'prompt': args.prompt,
         'features_compute': features_compute_list,
         'highlight_features': highlight_features_list,

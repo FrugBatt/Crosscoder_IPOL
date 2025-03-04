@@ -41,8 +41,14 @@ html = exp.run(
     config["tooltip_features"],
 )
 
+fig, _ = exp.plot_norm_hist()
+
 if os.path.exists(config["output_file"]):
     os.remove(config["output_file"])
+if os.path.exists(config["output_plot"]):
+    os.remove(config["output_plot"])
 
 with open(config["output_file"], "w") as f:
     f.write(html)
+
+fig.savefig(config["output_plot"])
